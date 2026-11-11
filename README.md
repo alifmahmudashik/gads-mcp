@@ -24,7 +24,7 @@ written to the `audit_log` table and Vercel logs.
 
 ### 1. Supabase
 1. Open your `gads-mcp` project -> **SQL Editor** -> **New query**.
-2. Paste the whole file `supabase/migrations/001_init.sql` -> **Run**.
+2. Paste the whole file `supabase/migrations/001_init.sql` -> **Run**, then do the same with `002_grants.sql`.
 3. **Project Settings -> API**: copy the **Project URL** and the **service_role** (secret) key. These go only into Vercel, never into chat or code.
 
 ### 2. GitHub
