@@ -10,3 +10,4 @@ next-env.d.ts
 client_secret*.json
 *.pem
 .vercel
+client_secret_*.json

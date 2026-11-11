@@ -122,7 +122,9 @@ export function makeAds(userId: string) {
     const data = await adsFetch<{ results?: GaqlRow[]; nextPageToken?: string; totalResultsCount?: string }>(
       `customers/${normalizeCustomerId(customerId)}/googleAds:search`,
       {
-        body: { query, pageSize: opts.pageSize, pageToken: opts.pageToken, returnTotalResultsCount: true },
+        // Send only fields every API version accepts (newer versions dropped returnTotalResultsCount / pageSize);
+        // row limits are applied client-side or with LIMIT in the query.
+        body: { query, ...(opts.pageToken ? { pageToken: opts.pageToken } : {}) },
         loginCustomerId: opts.loginCustomerId,
         signal: opts.signal
       }
