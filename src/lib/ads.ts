@@ -12,6 +12,31 @@ export type GaqlRow = Record<string, unknown>;
 
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
 
+/** One Google Ads account this user can reach, and how to reach it. */
+export interface AccountInfo {
+  id: string;
+  name: string;
+  manager: boolean;
+  status: string;
+  currency: string;
+  timeZone: string;
+  /** true = the signed-in Google user has direct access (no login-customer-id needed) */
+  direct: boolean;
+  /** Manager (MCC) account that reaches this account when there is no direct access */
+  viaManager: string | null;
+}
+
+interface AccessIndex {
+  at: number;
+  accounts: Map<string, AccountInfo>;
+}
+
+// Account -> how-to-reach map per user. Rebuilt every 30 minutes, or when a call is refused.
+const accessCache = new Map<string, AccessIndex>();
+const accessBuilds = new Map<string, Promise<AccessIndex>>();
+const ACCESS_TTL_MS = 30 * 60 * 1000;
+const ACCESS_MIN_REFRESH_MS = 10_000;
+
 function networkError(error: unknown): never {
   if (error instanceof AdsError) throw error;
   const detail = error instanceof Error ? error.message : String(error);
@@ -80,38 +105,134 @@ export function makeAds(userId: string) {
     return opt("GOOGLE_ADS_LOGIN_CUSTOMER_ID") || (await loadUser()).login_customer_id || undefined;
   }
 
+  /** Builds the account -> MCC map: every directly accessible account, plus everything under each manager. */
+  async function buildAccessIndex(signal: AbortSignal): Promise<AccessIndex> {
+    const list = await adsFetch<{ resourceNames?: string[] }>("customers:listAccessibleCustomers", { method: "GET", loginCustomerId: null, signal });
+    const ids = (list.resourceNames ?? []).map(r => r.replace("customers/", "")).slice(0, 60);
+    const accounts = new Map<string, AccountInfo>();
+    const query =
+      "SELECT customer_client.id, customer_client.descriptive_name, customer_client.manager, customer_client.status, customer_client.currency_code, customer_client.time_zone FROM customer_client";
+
+    const upsert = (id: string): AccountInfo => {
+      let a = accounts.get(id);
+      if (!a) {
+        a = { id, name: "", manager: false, status: "UNKNOWN", currency: "", timeZone: "", direct: false, viaManager: null };
+        accounts.set(id, a);
+      }
+      return a;
+    };
+
+    for (let i = 0; i < ids.length; i += 10) {
+      const batch = ids.slice(i, i + 10);
+      const settled = await Promise.allSettled(
+        batch.map(id =>
+          adsFetch<{ results?: GaqlRow[] }>(`customers/${id}/googleAds:search`, { body: { query }, loginCustomerId: id, signal }).then(r => ({ id, rows: r.results ?? [] }))
+        )
+      );
+      settled.forEach((res, n) => {
+        const root = batch[n];
+        upsert(root).direct = true;
+        if (res.status !== "fulfilled") return; // e.g. a canceled account: still listed, just without details
+        for (const row of res.value.rows) {
+          const cc = (row as { customerClient?: Record<string, unknown> }).customerClient;
+          if (!cc) continue;
+          const cid = String(cc.id);
+          const a = upsert(cid);
+          a.name = String(cc.descriptiveName ?? a.name);
+          a.manager = Boolean(cc.manager);
+          a.status = String(cc.status ?? a.status);
+          a.currency = String(cc.currencyCode ?? a.currency);
+          a.timeZone = String(cc.timeZone ?? a.timeZone);
+          if (cid !== root && !a.viaManager) a.viaManager = root;
+        }
+      });
+    }
+    return { at: Date.now(), accounts };
+  }
+
+  function refreshAccessIndex(signal: AbortSignal): Promise<AccessIndex> {
+    let build = accessBuilds.get(userId);
+    if (!build) {
+      build = buildAccessIndex(signal)
+        .then(idx => {
+          accessCache.set(userId, idx);
+          return idx;
+        })
+        .finally(() => accessBuilds.delete(userId));
+      accessBuilds.set(userId, build);
+    }
+    return build;
+  }
+
+  async function getAccessIndex(signal: AbortSignal, force = false): Promise<AccessIndex> {
+    const hit = accessCache.get(userId);
+    if (hit && !force && Date.now() - hit.at < ACCESS_TTL_MS) return hit;
+    if (hit && force && Date.now() - hit.at < ACCESS_MIN_REFRESH_MS) return hit;
+    return refreshAccessIndex(signal);
+  }
+
+  /** Which login-customer-id to send for a client account: null = none (direct access). */
+  async function resolveLogin(customerId: string, signal: AbortSignal, force = false): Promise<string | null> {
+    const id = normalizeCustomerId(customerId);
+    let idx = await getAccessIndex(signal, force);
+    let acc = idx.accounts.get(id);
+    if (!acc && !force) {
+      idx = await getAccessIndex(signal, true); // maybe a newly added account
+      acc = idx.accounts.get(id);
+    }
+    if (acc) return acc.direct ? null : acc.viaManager;
+    return (await getDefaultLoginId()) ?? null;
+  }
+
   async function adsFetch<T>(
     path: string,
     opts: { method?: "GET" | "POST"; body?: unknown; loginCustomerId?: string | null; signal: AbortSignal }
   ): Promise<T> {
     const version = opt("GOOGLE_ADS_API_VERSION") || DEFAULT_API_VERSION;
     const token = await getAccessToken(opts.signal);
-    const headers: Record<string, string> = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
-    const dev = opt("GOOGLE_ADS_DEVELOPER_TOKEN");
-    if (dev) headers["developer-token"] = dev;
-    // null = send none (listAccessibleCustomers); undefined = use the default MCC
-    const login = opts.loginCustomerId === undefined ? await getDefaultLoginId() : opts.loginCustomerId;
-    if (login) headers["login-customer-id"] = normalizeCustomerId(login);
 
-    let res: Response;
-    try {
-      res = await fetch(`https://googleads.googleapis.com/${version}/${path}`, {
-        method: opts.method ?? "POST",
-        headers,
-        body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
-        signal: AbortSignal.any([opts.signal, AbortSignal.timeout(30_000)])
-      });
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "TimeoutError") {
-        throw new AdsError("The Google Ads API did not respond within 30 seconds. Retry, or narrow the query.", 504);
+    const send = async (login: string | null | undefined): Promise<T> => {
+      const headers: Record<string, string> = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+      const dev = opt("GOOGLE_ADS_DEVELOPER_TOKEN");
+      if (dev) headers["developer-token"] = dev;
+      if (login) headers["login-customer-id"] = normalizeCustomerId(login);
+
+      let res: Response;
+      try {
+        res = await fetch(`https://googleads.googleapis.com/${version}/${path}`, {
+          method: opts.method ?? "POST",
+          headers,
+          body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+          signal: AbortSignal.any([opts.signal, AbortSignal.timeout(30_000)])
+        });
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "TimeoutError") {
+          throw new AdsError("The Google Ads API did not respond within 30 seconds. Retry, or narrow the query.", 504);
+        }
+        return networkError(error);
       }
-      return networkError(error);
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as GoogleErrorBody;
+        throw new AdsError(describeError(res.status, body), res.status);
+      }
+      return (await res.json()) as T;
+    };
+
+    // Explicit value (string = that MCC, null = send none) wins. Otherwise route automatically:
+    // calls on customers/<id>/... use the right MCC for that account; everything else uses the default MCC.
+    if (opts.loginCustomerId !== undefined) return send(opts.loginCustomerId);
+    const m = /^customers\/(\d{10})(?=[/:]|$)/.exec(path);
+    if (!m) return send(await getDefaultLoginId());
+    const login = await resolveLogin(m[1], opts.signal);
+    try {
+      return await send(login);
+    } catch (error) {
+      if (error instanceof AdsError && error.status === 403) {
+        const fresh = await resolveLogin(m[1], opts.signal, true).catch(() => login);
+        if (fresh !== login) return send(fresh);
+      }
+      throw error;
     }
-    if (!res.ok) {
-      const body = (await res.json().catch(() => ({}))) as GoogleErrorBody;
-      throw new AdsError(describeError(res.status, body), res.status);
-    }
-    return (await res.json()) as T;
   }
 
   async function gaqlSearch(
@@ -130,6 +251,19 @@ export function makeAds(userId: string) {
       }
     );
     return { rows: data.results ?? [], nextPageToken: data.nextPageToken, total: data.totalResultsCount === undefined ? undefined : Number(data.totalResultsCount) };
+  }
+
+  /** Runs a GAQL query and follows page tokens (up to maxPages pages) so bulk tools see every row. */
+  async function gaqlAll(customerId: string, query: string, opts: { maxPages?: number; loginCustomerId?: string; signal: AbortSignal }): Promise<GaqlRow[]> {
+    const rows: GaqlRow[] = [];
+    let pageToken: string | undefined;
+    for (let page = 0; page < (opts.maxPages ?? 10); page++) {
+      const res = await gaqlSearch(customerId, query, { pageToken, loginCustomerId: opts.loginCustomerId, signal: opts.signal });
+      rows.push(...res.rows);
+      pageToken = res.nextPageToken;
+      if (!pageToken) break;
+    }
+    return rows;
   }
 
   function assertWritesAllowed(validateOnly: boolean): void {
@@ -179,7 +313,7 @@ export function makeAds(userId: string) {
     return { email: u.email, loginCustomerId: await getDefaultLoginId(), writesEnabled: opt("ALLOW_WRITES") === "true" };
   }
 
-  return { adsFetch, gaqlSearch, mutate, assertWritesAllowed, audit, getDefaultLoginId, getUserInfo };
+  return { adsFetch, gaqlSearch, gaqlAll, mutate, assertWritesAllowed, audit, getDefaultLoginId, getUserInfo, getAccessIndex, resolveLogin };
 }
 
 export type Ads = ReturnType<typeof makeAds>;

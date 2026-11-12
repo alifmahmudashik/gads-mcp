@@ -9,6 +9,7 @@ import { campaignIdField, customerIdField, text } from "@/lib/format";
  *  2. A real change needs validate_only=false AND the ALLOW_WRITES secret set to "true".
  *  3. The result always shows before -> after, and every executed call is audit-logged.
  *  4. Nothing here can remove/delete campaigns, ads or budgets.
+ *  (Negative keywords, bulk URL / status changes and keyword adds live in bulk.ts.)
  */
 const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
 
@@ -95,32 +96,6 @@ Guards: refuses shared budgets unless allow_shared=true, and refuses increases a
   );
 
   server.registerTool(
-    "gads_add_campaign_negative_keywords",
-    {
-      title: "Add Campaign Negative Keywords",
-      description: `Add campaign-level negative keywords to one Search campaign. Find candidates with gads_search_terms (zero_conversions_only=true).
-
-Defaults to validate-only. Existing duplicates are not detected, so Google may reject exact duplicates.`,
-      inputSchema: z.strictObject({
-        customer_id: customerIdField,
-        campaign_id: campaignIdField,
-        keywords: z.array(z.string().min(1).max(80)).min(1).max(100).describe("Negative keyword texts, without match-type brackets/quotes"),
-        match_type: z.enum(["EXACT", "PHRASE", "BROAD"]).default("PHRASE").describe("Match type for all keywords in this call"),
-        validate_only: validateOnlyField
-      }),
-      annotations: WRITE
-    },
-    async ({ customer_id, campaign_id, keywords, match_type, validate_only }, ctx) => {
-      const cid = normalizeCustomerId(customer_id);
-      const operations = keywords.map(k => ({
-        create: { campaign: `customers/${cid}/campaigns/${campaign_id}`, negative: true, keyword: { text: k.trim(), matchType: match_type } }
-      }));
-      await api.mutate(customer_id, "campaignCriteria", operations, validate_only, ctx.mcpReq.signal);
-      return text(`${banner(validate_only)}\n\nCampaign ${campaign_id}: ${keywords.length} negative keyword(s), ${match_type} match:\n${keywords.map(k => `- ${k}`).join("\n")}`);
-    }
-  );
-
-  server.registerTool(
     "gads_update_ad_final_urls",
     {
       title: "Update Ad Final URLs",
@@ -147,10 +122,11 @@ Find ad_group_id and ad_id with gads_run_gaql: SELECT ad_group.id, ad_group_ad.a
       if (!row) return { isError: true, ...text(`Ad ${ad_id} not found in ad group ${ad_group_id}. Check the IDs with gads_run_gaql.`) };
       const before = row.adGroupAd?.ad?.finalUrls ?? [];
 
+      // Ad URLs are edited through the ads service (adGroupAds rejects ad.final_urls updates)
       await api.mutate(
         customer_id,
-        "adGroupAds",
-        [{ updateMask: "ad.final_urls", update: { resourceName: `customers/${cid}/adGroupAds/${ad_group_id}~${ad_id}`, ad: { finalUrls: final_urls } } }],
+        "ads",
+        [{ updateMask: "final_urls", update: { resourceName: `customers/${cid}/ads/${ad_id}`, finalUrls: final_urls } }],
         validate_only,
         ctx.mcpReq.signal
       );

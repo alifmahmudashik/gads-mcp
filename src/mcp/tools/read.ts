@@ -25,10 +25,17 @@ export function registerReadTools(server: McpServer, api: Ads): void {
       inputSchema: z.strictObject({}),
       annotations: READ_ONLY
     },
-    async () => {
+    async (_args, ctx) => {
       const info = await api.getUserInfo();
+      const idx = await api.getAccessIndex(ctx.mcpReq.signal).catch(() => undefined);
+      const accounts = idx ? [...idx.accounts.values()] : [];
+      const managers = accounts.filter(a => a.manager);
+      const clients = accounts.filter(a => !a.manager && a.status === "ENABLED");
+      const scan = idx
+        ? `Accounts reachable: ${clients.length} active client account(s) under ${managers.length} manager (MCC) account(s). The right MCC is chosen automatically for every account (use gads_find_account to search by name).`
+        : "Account scan unavailable right now (retry); accounts are still accessed directly.";
       return text(
-        `Connected Google account: ${info.email}\nManager (MCC) account: ${info.loginCustomerId ?? "none detected (accounts are accessed directly)"}\nReal changes enabled: ${info.writesEnabled ? "yes" : "no (previews only; set ALLOW_WRITES=true in Vercel to enable)"}`
+        `Connected Google account: ${info.email}\n${scan}\nReal changes enabled: ${info.writesEnabled ? "yes" : "no (previews only; set ALLOW_WRITES=true in Vercel to enable)"}`
       );
     }
   );
@@ -60,22 +67,29 @@ Use this first to discover account IDs. For accounts under your MCC, use gads_li
       title: "List Child Accounts",
       description: `List client accounts under a manager (MCC) account, with name, currency, time zone and status.
 
-Defaults to the configured GOOGLE_ADS_LOGIN_CUSTOMER_ID. Example: "Which client accounts do I manage?"`,
+Omit manager_id to list every account under all your MCCs. Example: "Which client accounts do I manage?" (gads_find_account searches by name.)`,
       inputSchema: z.strictObject({
-        manager_id: customerIdField.optional().describe("Manager account ID. Defaults to the configured MCC."),
+        manager_id: customerIdField.optional().describe("Manager account ID. Omit to list accounts under ALL your MCCs."),
         include_inactive: z.boolean().default(false).describe("Include canceled/suspended accounts"),
         response_format: responseFormatField
       }),
       annotations: READ_ONLY
     },
     async ({ manager_id, include_inactive, response_format }, ctx) => {
-      const mcc = manager_id ?? (await api.getDefaultLoginId());
-      if (!mcc) return text("No manager account was detected. Pass manager_id, or sign in again on the /connect page.");
+      const mcc = manager_id;
+      if (!mcc) {
+        const idx = await api.getAccessIndex(ctx.mcpReq.signal);
+        const all = [...idx.accounts.values()]
+          .filter(a => include_inactive || a.status === "ENABLED")
+          .sort((x, y) => x.name.localeCompare(y.name))
+          .map(a => ({ id: a.id, name: a.name, type: a.manager ? "Manager (MCC)" : "Client", status: a.status, currency: a.currency, time_zone: a.timeZone, access: a.direct ? "direct" : `via ${a.viaManager}` }));
+        return renderRows(all, response_format, { title: "All accessible accounts (every MCC)" }, 500);
+      }
       const statusFilter = include_inactive ? "" : "AND customer_client.status = 'ENABLED'";
       const { rows } = await api.gaqlSearch(
         mcc,
         `SELECT customer_client.id, customer_client.descriptive_name, customer_client.manager, customer_client.status, customer_client.currency_code, customer_client.time_zone, customer_client.level FROM customer_client WHERE customer_client.level >= 1 ${statusFilter} ORDER BY customer_client.descriptive_name`,
-        { loginCustomerId: mcc, signal: ctx.mcpReq.signal }
+        { loginCustomerId: manager_id, signal: ctx.mcpReq.signal }
       );
       return renderRows(rows, response_format, { title: `Accounts under ${mcc}` }, 500);
     }
@@ -142,9 +156,9 @@ Example: "How did the Vending Machine Distributor account perform last 30 days?"
     "gads_search_terms",
     {
       title: "Search Terms Report",
-      description: `Search terms that triggered ads (Search campaigns), sorted by cost. Use it to find wasted spend and negative keyword candidates; then use gads_add_campaign_negative_keywords.
+      description: `Search terms that triggered ads, sorted by cost. Use it to find wasted spend and negative keyword candidates; then use gads_add_negative_keywords.
 
-Note: Performance Max search terms are not included here.`,
+source=search (default) covers Search campaigns; source=pmax covers Performance Max search terms. For more splits (device, date, ad group) use gads_report level=search_term.`,
       inputSchema: z.strictObject({
         customer_id: customerIdField,
         campaign_id: campaignIdField.optional().describe("Limit to one campaign"),
@@ -153,16 +167,23 @@ Note: Performance Max search terms are not included here.`,
         end_date: endDateField,
         min_clicks: z.number().int().min(0).default(1).describe("Only terms with at least this many clicks"),
         zero_conversions_only: z.boolean().default(false).describe("Only terms with 0 conversions (negative keyword candidates)"),
+        min_cost: z.number().min(0).optional().describe("Only terms with at least this cost (account currency units)"),
+        source: z.enum(["search", "pmax"]).default("search").describe("search = Search campaigns (search_term_view); pmax = Performance Max / AI Max search terms (campaign_search_term_view)"),
         limit: z.number().int().min(1).max(500).default(50),
         response_format: responseFormatField
       }),
       annotations: READ_ONLY
     },
-    async ({ customer_id, campaign_id, date_range, start_date, end_date, min_clicks, zero_conversions_only, limit, response_format }, ctx) => {
+    async ({ customer_id, campaign_id, date_range, start_date, end_date, min_clicks, zero_conversions_only, min_cost, source, limit, response_format }, ctx) => {
       const filters = [dateClause(date_range, start_date, end_date), `metrics.clicks >= ${min_clicks}`];
       if (campaign_id) filters.push(`campaign.id = ${campaign_id}`);
       if (zero_conversions_only) filters.push("metrics.conversions = 0");
-      const query = `SELECT search_term_view.search_term, search_term_view.status, campaign.id, campaign.name, ad_group.name, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions FROM search_term_view WHERE ${filters.join(" AND ")} ORDER BY metrics.cost_micros DESC`;
+      if (min_cost !== undefined) filters.push(`metrics.cost_micros >= ${Math.round(min_cost * 1_000_000)}`);
+      const head =
+        source === "pmax"
+          ? "campaign_search_term_view.search_term, campaign.id, campaign.name"
+          : "search_term_view.search_term, search_term_view.status, campaign.id, campaign.name, ad_group.name";
+      const query = `SELECT ${head}, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.conversions_value FROM ${source === "pmax" ? "campaign_search_term_view" : "search_term_view"} WHERE ${filters.join(" AND ")} ORDER BY metrics.cost_micros DESC`;
       const { rows, nextPageToken, total } = await api.gaqlSearch(customer_id, query, { pageSize: limit, signal: ctx.mcpReq.signal });
       return renderRows(rows, response_format, { title: "Search terms", total, nextPageToken }, limit);
     }

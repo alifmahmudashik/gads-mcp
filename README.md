@@ -11,10 +11,17 @@ Google account chooser -> `/api/oauth/google/callback` (we save your Google logi
 access token (`/api/oauth/token`). `ALLOWED_EMAILS=*` lets any verified Google account sign in; each user only reaches the Ads accounts their own Google login can access. Set a comma-separated list to restrict it.
 
 ## Tools
-`gads_whoami` · `gads_list_accessible_customers` · `gads_list_child_accounts` · `gads_run_gaql` (any read) ·
-`gads_campaign_performance` · `gads_search_terms` · `gads_list_fields` ·
-`gads_mutate` (create/update/remove on ANY resource) · `gads_api_request` (any other REST endpoint) ·
-shortcuts: `gads_set_campaign_status`, `gads_set_campaign_budget`, `gads_add_campaign_negative_keywords`, `gads_update_ad_final_urls`
+**Accounts (automatic MCC routing):** `gads_find_account` (search by name or ID across all your MCCs) · `gads_list_child_accounts` · `gads_list_accessible_customers` · `gads_whoami`.
+You never pass an MCC: for any account the server works out the right `login-customer-id` itself (cached 30 min, re-checked if Google refuses).
+
+**Read:** `gads_report` (campaign / ad group / ad / keyword / search term / PMax search term / asset group / landing page / geo, split by date, week, month, day of week, hour, **device**, network, **conversion action**) ·
+`gads_compare_periods` (this month vs last month, per day, per campaign) · `gads_conversion_actions` · `gads_change_history` · `gads_list_negatives` ·
+`gads_campaign_performance` · `gads_search_terms` (Search + PMax) · `gads_run_gaql` (any query) · `gads_list_fields`
+
+**Write:** `gads_add_negative_keywords` (campaign / ad group / shared list / account level, duplicates skipped, many accounts at once) · `gads_add_keywords` ·
+`gads_bulk_replace_urls` (ads, keywords, PMax asset groups, sitelink assets) · `gads_bulk_set_status` (pause / enable many) ·
+`gads_set_campaign_status` · `gads_set_campaign_budget` · `gads_update_ad_final_urls` ·
+`gads_mutate` (create/update/remove on ANY resource) · `gads_api_request` (any other REST endpoint)
 
 **Write safety:** every write defaults to `validate_only=true` (Google checks it, nothing changes). A real change needs
 `validate_only=false` **and** `ALLOW_WRITES=true` in Vercel. Deletes need `allow_remove=true`. Executed changes are

@@ -20,7 +20,18 @@ export const customerIdField = z
 export const campaignIdField = z.string().regex(/^\d+$/, "Campaign ID must be digits only").describe("Campaign ID (digits)");
 
 export const dateRangeField = z
-  .enum(["TODAY", "YESTERDAY", "LAST_7_DAYS", "LAST_14_DAYS", "LAST_30_DAYS", "THIS_MONTH", "LAST_MONTH"])
+  .enum([
+    "TODAY",
+    "YESTERDAY",
+    "LAST_7_DAYS",
+    "LAST_14_DAYS",
+    "LAST_30_DAYS",
+    "THIS_MONTH",
+    "LAST_MONTH",
+    "THIS_WEEK_MON_TODAY",
+    "LAST_WEEK_MON_SUN",
+    "LAST_BUSINESS_WEEK"
+  ])
   .default("LAST_30_DAYS")
   .describe("Predefined date range. Ignored when both start_date and end_date are given.");
 
@@ -123,3 +134,8 @@ export function jsonText(value: unknown): string {
   const t = JSON.stringify(value, null, 2) ?? "null";
   return t.length > CHARACTER_LIMIT ? `${t.slice(0, CHARACTER_LIMIT)}\n... [truncated: response exceeded ${CHARACTER_LIMIT} characters; narrow the request]` : t;
 }
+
+/** Escapes a value for use inside single quotes in GAQL. */
+export const gaqlString = (v: string): string => v.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+
+export const idListField = z.array(z.string().regex(/^\d+$/, "IDs are digits only")).min(1).max(200);
