@@ -1,5 +1,18 @@
--- Google Ads MCP server schema. Run once in Supabase: SQL Editor -> New query -> paste -> Run.
--- All tables are locked down with RLS (no policies): only the server's service key can read/write them.
+-- ============================================================================
+-- Google Ads MCP server: complete database setup (one file, run it once)
+--
+-- How to run: Supabase dashboard -> SQL Editor -> New query -> paste this whole
+-- file -> Run. It is safe to run again: nothing is dropped or overwritten.
+--
+-- Part 1: tables
+-- Part 2: row level security (RLS) so only the server's secret key can read/write
+-- Part 3: permissions for that secret key (service_role)
+-- ============================================================================
+
+
+-- ---------------------------------------------------------------------------
+-- Part 1: tables
+-- ---------------------------------------------------------------------------
 
 create table if not exists users (
   id uuid primary key default gen_random_uuid(),
@@ -54,9 +67,31 @@ create table if not exists audit_log (       -- every executed (or previewed) Go
   entry jsonb not null
 );
 
+
+-- ---------------------------------------------------------------------------
+-- Part 2: lock the tables down
+-- RLS is on and there are deliberately no policies, so the public/publishable
+-- key can never read or write anything. Only the server's secret key can.
+-- ---------------------------------------------------------------------------
+
 alter table users enable row level security;
 alter table oauth_clients enable row level security;
 alter table oauth_auth_requests enable row level security;
 alter table oauth_codes enable row level security;
 alter table oauth_tokens enable row level security;
 alter table audit_log enable row level security;
+
+
+-- ---------------------------------------------------------------------------
+-- Part 3: let the server's secret key (service_role) use the tables
+-- Newer Supabase projects do not auto-grant table access to service_role.
+-- Without this, every server query fails with "permission denied for table ...".
+-- anon/authenticated (the publishable key) still get nothing.
+-- ---------------------------------------------------------------------------
+
+grant usage on schema public to service_role;
+grant select, insert, update, delete on all tables in schema public to service_role;
+grant usage, select on all sequences in schema public to service_role;
+
+alter default privileges in schema public grant select, insert, update, delete on tables to service_role;
+alter default privileges in schema public grant usage, select on sequences to service_role;
